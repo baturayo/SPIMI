@@ -1,17 +1,24 @@
 """
 This script index documents by using SPIMI indexing technique
 """
-import string
 from nltk.corpus import stopwords
-from nltk.stem import PorterStemmer
 from collections import defaultdict
-from Compress.VariableByteCode import VariableByteCode
+from src.Compress.GammaCode import GammaCode
 from bitstring import BitArray
 from os import listdir
 import sys
 import os
 import string
 import re
+
+
+def rename_file(path, old, new):
+    """
+    Rename a file
+    """
+    for f in os.listdir(path):
+        os.rename(os.path.join(path, f),
+                  os.path.join(path, f.replace(old, new)))
 
 
 def getSortedBlockNames():
@@ -142,7 +149,7 @@ def safe_readline(_file, curr_line):
                 next_line = _file.readline()
 
 
-def invert_block(docs):
+def invert_block(docs, path):
     """
     The method creates a dictionary object of a fixed sized and try to add as much document as the capacity limit.
     The key of dict include the terms and the posting list have the document ids
@@ -152,43 +159,42 @@ def invert_block(docs):
     block_index = 0
 
     # Create dict block
-    dictBlock = defaultdict(str)
-    vb_code = VariableByteCode()
+    dictBlock = defaultdict(BitArray)
+    gamma_code = GammaCode()
+
 
     # Iterate over docs
-    for docID, doc in docs:
-        doc = string.replace(doc, '\n', ' ')
-        terms_in_doc = dict()
+    for doc_name in docs:
+        docID = int(doc_name.split('.')[0])
+        with open(path + doc_name, 'r') as doc:
+            doc = doc.read()
+            doc = string.replace(doc, '\n', ' ')
 
-        # TOKENIZE
-        for term in doc.split(' '):
-            term = preprocessDoc(term)
-            # Check whether term has a char (if it is a stop word than term == '')
-            if term != '' and not terms_in_doc.has_key(term):
-                terms_in_doc[term] = ''  # Save terms for each doc in order not to add it again for duplicate terms
-                # If term does not exist at keys before simply append doc ID
-                if dictBlock[term] == '':
-                    vb_code_encoded = vb_code.VB_encode_number(docID)
-                    dictBlock[term] += vb_code_encoded  # Append encoded str
+            # TOKENIZE
+            for term in doc.split(' '):
+                term = preprocessDoc(term)
+                # Check whether term has a char (if it is a stop word than term == '')
+                if term != '':
+                    # If term does not exist at keys before simply append doc ID
+                    if dictBlock[term] == '':
+                        gamma_code_encoded = gamma_code.gamma_encode_number(docID)
+                        dictBlock[term].append(gamma_code_encoded)  # Append binary
 
-                # Else append the difference between last doc ID and current doc ID
-                else:
-                    lastDocID = sum(vb_code.VB_decode(dictBlock[term]))
-                    currentDocID = docID
-                    diff = currentDocID - lastDocID
-                    gamma_code_diff = vb_code.VB_encode_number(diff)  # Compress with gamma code
-                    dictBlock[term] += gamma_code_diff  # Append encoded str
+                    # Else append the difference between last doc ID and current doc ID
+                    else:
+                        lastDocID = sum(gamma_code.gamma_decode(dictBlock[term]))
+                        currentDocID = docID
+                        diff = currentDocID - lastDocID
+                        gamma_code_diff = gamma_code.gamma_encode_number(diff)  # Compress with gamma code
+                        dictBlock[term].append(gamma_code_diff)  # Append binary
 
-        if sys.getsizeof(dictBlock) > blockCapacityLimit:
-            # Append dictBlock object to blocks list object
-            saveBlockDict2Disc(block_index, dictBlock, 'wb', True)
-            # Empty dict block
-            dictBlock = defaultdict(str)
+            if sys.getsizeof(dictBlock) > blockCapacityLimit:
+                # Append dictBlock object to blocks list object
+                saveBlockDict2Disc(block_index, dictBlock, 'wb', True)
+                # Empty dict block
+                dictBlock = defaultdict(BitArray)
 
-            block_index += 1
-
-        if docID > 200:
-            break
+                block_index += 1
 
     # Save dictBlock object to disc
     saveBlockDict2Disc(block_index, dictBlock, 'wb', True)
@@ -214,13 +220,14 @@ def saveBlockDict2Disc(blockIndex, block, format, isDict):
 
     # Save dict block to disc
     fileName = 'Blocks/%s.txt' % blockIndex
-
+    gammaCode = GammaCode()
     with open(fileName, format) as out:
         # If the block is dict object
         if isDict:
             for key, values in sortedDictBlock:
+                compressed_pl = gammaCode.padding_before_saving_disc(values)
                 try:
-                    out.write(str(key) + ',{' + values + '}\n')  # Write bytes into file
+                    out.write(str(key) + ',{' + compressed_pl.tobytes() + '}\n')  # Write bytes into file
                 except UnicodeEncodeError:
                     print(key)
         else: # If the block is list object
@@ -235,17 +242,17 @@ def merge2CompressedPostingLists(posting1, posting2):
     :param posting2: List Object
     :return: merged posting list
     """
-    vb_code = VariableByteCode()
-    decoded_posting1 = VariableByteCode.VB_decode(BitArray('0x' + posting1).tobytes())
-    decoded_posting2 = VariableByteCode.VB_decode(BitArray('0x' + posting2).tobytes())
+    gammaCode = GammaCode()
+    decoded_posting1 = gammaCode.gamma_decode_block(posting1)
+    decoded_posting2 = gammaCode.gamma_decode_block(posting2)
     first_element_posting2 = decoded_posting2[0]
     sum_posting1 = sum(decoded_posting1)
     mergedPosting = decoded_posting1 + [(first_element_posting2 - sum_posting1)] + decoded_posting2[1:]
-    vb_encoded_merged_posting = vb_code.VB_encode(mergedPosting)
-    return vb_encoded_merged_posting
+    gamma_encoded_merged_posting = gammaCode.gamma_encode(mergedPosting)
+    return gamma_encoded_merged_posting
 
 
-def merging2Blocks(block1, block2, blockCapacityLimit=1000):
+def merging2Blocks(block1, block2):
     path = 'Blocks/'
 
     # Define files
@@ -272,7 +279,7 @@ def merging2Blocks(block1, block2, blockCapacityLimit=1000):
             block2_posting = posting_2.encode('hex')
 
             merged_posting = merge2CompressedPostingLists(block1_posting, block2_posting)
-            cacheList.append(dict_key_1 + ',{' + merged_posting + '}\n')
+            cacheList.append(dict_key_1 + ',{' + bytes(merged_posting.tobytes()) + '}\n')
 
             # Skip to Next  lines
             dict_key_1, posting_1, next_line_1 = safe_readline(block1_file, current_line_1)
@@ -360,34 +367,44 @@ def mergeAllBlocks():
             merging2Blocks(block1, block2)  # Merge two blocks
             deleteMergedBlocks(block1, block2)  # Delete blocks after merging
 
-    # --- AFTER MERGING ALL FILES CHANGE INDEX FILE NAME
-    def rename(path, old, new):
-        """
-        Rename a file
-        """
-        for f in os.listdir(path):
-            os.rename(os.path.join(path, f),
-                      os.path.join(path, f.replace(old, new)))
-
     blockNames, n_blocks = getSortedBlockNames()
     merged_index_file_name = blockNames[0]
-    rename('Blocks/', merged_index_file_name, 'vb_code_index.txt')
+    rename_file('Blocks/', merged_index_file_name, 'gamma_index.txt')
 
 
-def index_docs(docs, buffer):
+def index_docs(docs, buffer, path):
     """
     Main method that index the documents with SPIMI algorithm
     :param docs: Documents include doc ids and body text
     :param buffer_size: Maximum size of each block for SPIMI algorithm
+    :param path: path of documents
     """
+    print('--------------------------------------------')
+    print('Indexing has been started..')
     global blockCapacityLimit
     blockCapacityLimit = buffer
-    invert_block(docs)
+    invert_block(docs, path)
+    print('All documents are inverted!')
     mergeAllBlocks()
+    print('All inverted blocks are merged!')
+    print('--------------------------------------------')
 
-    # with open('Blocks/vb_code_index.txt', 'rb') as out:
-    #     while True:
-    #         key, value = safe_readline(out)
-    #         value = value.encode('hex')
-    #         decompressed_value = VariableByteCode.VB_decode(BitArray('0x' + value).tobytes())
-    #         print(key, decompressed_value)
+# if __name__ == '__main__':
+#     d1 = '.D1 10 Introduction. to data data data data data mining'
+#     d2 = 'Data mining: concepts and techniques'
+#     d3 = 'Elements of statistical learning'
+#     d4 = 'Introduction to data mining'
+#     d5 = 'Introduction to machine learning'
+#
+#     blockCapacityLimit = 1000  # GLOBAL VAR
+#     docs = [d1, d2, d3, d4, d5]
+#     invert_block(docs)
+#     mergeAllBlocks()
+#
+#     with open('Blocks/gamma_index.txt', 'rb') as out:
+#         gammaCode = GammaCode()
+#         while True:
+#             key, value = safe_readline(out)
+#             value = value.encode('hex')
+#             decompressed_value = gammaCode.gamma_decode_block(value)
+#             print(key, decompressed_value)
